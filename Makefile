@@ -1,6 +1,6 @@
-# Default sing-box features: QUIC, browser TLS fingerprints, WireGuard and gVisor.
+# Default sing-box-lx features: QUIC, browser TLS fingerprints, WireGuard/AWG and gVisor.
 # Additional protocol tags increase the binary size.
-TAGS ?= with_quic,with_utls,with_wireguard,with_gvisor
+TAGS ?= with_quic,with_utls,with_wireguard,with_awg,with_gvisor
 LDFLAGS := -s -w -buildid=
 ifneq ($(RELEASE_VERSION),)
 LDFLAGS += -X github.com/ordo-systems/keen-proxy/internal/api.releaseVersion=$(RELEASE_VERSION)
@@ -10,6 +10,8 @@ endif
 # Prefer an installed nvm Node 22 toolchain; Vite needs Node 20.19+ or 22.12+.
 NODE_BIN ?= $(shell ls -d $(HOME)/.nvm/versions/node/v22.*/bin 2>/dev/null | tail -1)
 NPM := PATH="$(NODE_BIN):$$PATH" npm
+# Preview identity is separate from the last published installer version.
+DEMO_VERSION = $(shell PATH="$(NODE_BIN):$$PATH" node -p "require('./web/src/demo/release.json').version")
 
 .PHONY: test vet web build ui-demo build-router build-router-lite clean integration test-install check-language docs docs-preview
 
@@ -33,9 +35,10 @@ web:
 build: web
 	go build -tags $(TAGS),ui -o bin/keenproxy ./cmd/keenproxy
 
-# Run the local UI demo with synthetic traffic and in-memory configuration.
-ui-demo: build
-	mkdir -p bin/demo && ./bin/keenproxy -ui-demo -config examples/demo.yaml
+# Run the local preview without relabeling the normal development binary.
+ui-demo: web
+	go build -tags $(TAGS),ui -ldflags "-X github.com/ordo-systems/keen-proxy/internal/api.releaseVersion=v$(DEMO_VERSION)" -o bin/keenproxy-demo ./cmd/keenproxy
+	mkdir -p bin/demo && ./bin/keenproxy-demo -ui-demo -config examples/demo.yaml
 
 # Cross-compile Linux router binaries for ARM32, ARM64 and both MIPS byte orders.
 build-router: web
@@ -46,7 +49,7 @@ build-router: web
 
 # Use the reduced protocol registry for memory-constrained routers.
 # See internal/engine/registry_lite.go for supported protocols.
-LITE_TAGS := keenproxy_lite,with_utls,with_wireguard,with_gvisor,ui
+LITE_TAGS := keenproxy_lite,with_utls,with_wireguard,with_awg,with_gvisor,ui
 build-router-lite: web
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=5,softfloat go build -tags $(LITE_TAGS) -trimpath -ldflags "$(LDFLAGS)" -o dist/keenproxy-lite-linux-armv5 ./cmd/keenproxy
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags $(LITE_TAGS) -trimpath -ldflags "$(LDFLAGS)" -o dist/keenproxy-lite-linux-arm64 ./cmd/keenproxy

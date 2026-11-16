@@ -2,6 +2,25 @@
 
 These screenshots show the same Vue screens shipped by KeenProxy, running in the independent browser demo. Addresses, counters, profiles, and results are synthetic. The guide covers the implemented interface, rather than promising every feature shown in historical mockups.
 
+## Access the panel
+
+After a successful installation or command-line update, the installer prints the panel URL. Open it from your LAN. To display the current login token, run this command in the router's Entware shell:
+
+```sh
+keenproxy --key
+```
+
+Paste the token into the sign-in form. Treat it as a password: do not include it in screenshots, support reports or shared terminal output. The installer does not print the token automatically.
+
+You can display the URL again with `keenproxy --url`. Both commands read the existing configuration without starting the daemon or changing its settings. `--key` reads the configured `api.token_file`; it does not create or rotate a missing token. For a non-default configuration:
+
+```sh
+keenproxy --key --config /path/to/config.yaml
+keenproxy --url --config /path/to/config.yaml
+```
+
+The URL follows `api.listen`; wildcard listeners use an address from the configured LAN interface. If that interface has no usable address, no address is guessed. A loopback listener remains accessible only from the router or through a suitable SSH tunnel. See [installation and updates](getting-started.md#install-or-update-from-github).
+
 ## 1. Read the overview
 
 Open **Overview** to see connection health, recent traffic, and the router's CPU and memory usage. The first resource row covers the whole router. The **KeenProxy** row shows its share of total router CPU time and its resident memory (RSS). This includes embedded sing-box. An external TrustTunnel client is measured by the router totals. When a new release is available, follow its notice to **Settings**. Traffic graphs describe observed activity and cannot establish whether traffic leaks.
@@ -12,13 +31,56 @@ Open **Overview** to see connection health, recent traffic, and the router's CPU
 
 Open **Connections**. Select a profile to inspect its settings and status. Choose **Add** to use the wizard: import a supported connection link/file or enter a supported protocol manually. Use a descriptive name and inspect the proposed protocol and endpoint before accepting.
 
-The file picker accepts `.conf`, `.txt`, and `.json` up to 2 MiB. For a sing-box file with multiple profiles, choose the outbound or endpoint to import. Router DNS and routes stay under KeenProxy control. In **Failover**, choose the immediate backup and review the inherited chain. Connection parameters stay hidden until you reveal them. See [how failover works](routing.md#fallback-chains).
+The file picker accepts `.conf`, `.txt`, `.json`, and `.vpn` up to 2 MiB. For a sing-box file with multiple profiles, choose the outbound or endpoint to import. Router DNS and routes stay under KeenProxy control. In **Failover**, choose the immediate backup and review the inherited chain. Connection parameters stay hidden until you reveal them. See [how failover works](routing.md#fallback-chains).
 
 Changes enter the shared draft. Real credentials belong only in your local management session. In the browser demo, use synthetic values.
 
 ![Connection profiles and routing targets](../assets/screenshots/en-connections.png)
 
 ![Connection creation wizard](../assets/screenshots/en-wizard.png)
+
+### AmneziaWG profiles (experimental lx build)
+
+Import a single-peer AmneziaWG `.conf` file or paste its contents in the connection wizard. AWG fields select **AmneziaWG** automatically; you can also select the AmneziaWG protocol explicitly. The original profile stays in the shared draft and can be edited before **Apply**. Keep it private: it contains the tunnel's private key and may contain a preshared key.
+
+This build embeds [sing-box-lx 1.14.4-lx.35](https://github.com/Leadaxe/sing-box-lx/releases/tag/v1.14.4-lx.35). It supports AWG 2/3 client parameters and application TCP/UDP through a userspace WireGuard endpoint; the outer tunnel uses UDP. No kernel AWG module or additional daemon is required. Unsupported fields, executable hooks and multiple peers are rejected instead of being silently discarded.
+
+For a standalone Amnezia `vpn://` client export, choose **AmneziaWG → Paste .conf / vpn://**, paste the complete link, enter a name and ID, and validate. You can also upload a text or `.vpn` file containing the link. Decoding happens locally in KeenProxy's backend, without contacting Amnezia or registering a device. If the export contains several AWG profiles, select one explicitly and validate again before saving it to the draft. Only the selected AWG client configuration is retained; SSH credentials, source-envelope metadata, DNS policy and other protocols are not imported. The static browser-only demo cannot decode these exports.
+
+Compressed and uncompressed standalone exports with supported format versions (missing, 0 or 1) are accepted. The encoded URI is limited to 2 MiB and decoded JSON to 1 MiB. An export may contain at most 32 AWG candidates, with at most 1 MiB of native profile text in total; an over-limit export is rejected as a whole, without partial import. Damaged exports, unsupported protocol options, service/subscription keys and administrator-only exports without client keys are rejected. A `vpn://` link is not necessarily a ready-to-use tunnel: obtain a **client connection export**, not a subscription activation key.
+
+To bound router memory use, junk bursts are limited to 256 packets and 1 MiB of worst-case payload per handshake. The same budget applies to native AWG profiles and core-decoded raw WireGuard endpoints.
+
+The profile's `DNS` setting does not replace KeenProxy DNS settings. Existing routing rules and failover still select the connection; `AllowedIPs` does not install system routes. Application UDP requires **TPROXY** interception. The existing participant **UDP/443 rejection remains enabled**, so importing AWG does not enable client QUIC traffic. Amnezia subscription activation, server provisioning and service API integration are not supported.
+
+For YAML configuration, store the profile as a block scalar:
+
+```yaml
+connections:
+  - id: awg
+    name: AmneziaWG
+    type: amneziawg
+    amneziawg: |
+      [Interface]
+      PrivateKey = <client-private-key-base64>
+      Address = 10.77.0.2/32
+      Jc = 3
+      Jmin = 40
+      Jmax = 80
+      S1 = 20
+      S2 = 30
+      H1 = 1001
+      H2 = 1002
+      H3 = 1003
+      H4 = 1004
+      [Peer]
+      PublicKey = <server-public-key-base64>
+      Endpoint = vpn.example.com:51820
+      AllowedIPs = 0.0.0.0/0
+```
+
+Replace the placeholders and obfuscation values with those exported by your server. Before rolling back to an official-sing-box build, remove or replace AmneziaWG connections in the draft and Apply: the older engine cannot use this profile type.
+
 
 ## 3. Add a routing group
 

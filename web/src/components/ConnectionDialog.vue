@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { NModal, NCard, NTabs, NTabPane, NInput, NButton, NForm, NFormItem, NAlert, NSpace, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { api } from '../api'
 import { store } from '../store'
-import type { Connection, LinkPreview, WireGuard } from '../types'
-import { parseWireGuardConf, slugify, wireGuardToConf } from '../wgconf'
+import type { Config, Connection, LinkPreview } from '../types'
+import { slugify, wireGuardToConf } from '../wgconf'
+import { connectionErrorKey, DRAFT_CHANGED, importConnections, manualConnection } from '../connectionDraft'
 
 // Edit a local form copy so cancellation leaves the shared draft unchanged.
 const props = defineProps<{ show: boolean; edit?: Connection | null }>()
@@ -13,12 +14,14 @@ const emit = defineEmits<{ (e: 'update:show', v: boolean): void }>()
 const message = useMessage()
 const { t } = useI18n()
 
-const tab = ref<'link' | 'wireguard' | 'singbox'>('link')
+const tab = ref<'link' | 'wireguard' | 'amneziawg' | 'singbox'>('link')
 const name = ref('')
 const id = ref('')
 const idTouched = ref(false)
 const link = ref('')
 const wgText = ref('')
+const awgText = ref('')
+const busy = ref(false)
 const sbText = ref('')
 const preview = ref<LinkPreview | null>(null)
 const previewError = ref('')
@@ -27,8 +30,15 @@ const revealed = ref(false)
 const fallback = ref<string | null>(null)
 const isEdit = computed(() => !!props.edit)
 
+let saveGeneration = 0
+let committed = false
+onUnmounted(() => { saveGeneration++ })
 watch(() => props.show, (open) => {
-  if (!open) return
+  if (!open) {
+    saveGeneration++
+    return
+  }
+  committed = false
   error.value = ''
   revealed.value = false
   preview.value = null
@@ -40,10 +50,11 @@ watch(() => props.show, (open) => {
   fallback.value = c?.fallback ?? null
   link.value = c?.link ?? c?.trusttunnel?.link ?? ''
   wgText.value = c?.wireguard ? wireGuardToConf(c.wireguard) : ''
+  awgText.value = c?.amneziawg ?? ''
   sbText.value = c?.outbound || c?.endpoint
     ? JSON.stringify({ [c.outbound ? 'outbound' : 'endpoint']: c.outbound ?? c.endpoint }, null, 2)
     : ''
-  tab.value = c?.type === 'wireguard' ? 'wireguard' : c?.type === 'singbox' ? 'singbox' : 'link'
+  tab.value = c?.type === 'amneziawg' ? 'amneziawg' : c?.type === 'wireguard' ? 'wireguard' : c?.type === 'singbox' ? 'singbox' : 'link'
   if (link.value) checkLink()
 })
 
@@ -76,10 +87,10 @@ function build(): Connection {
     if (l.startsWith('tt://')) return { ...base, type: 'trusttunnel', trusttunnel: { ...props.edit?.trusttunnel, link: l } }
     return { ...base, type: 'link', link: l }
   }
-  if (tab.value === 'wireguard') {
-    const wg: WireGuard = parseWireGuardConf(wgText.value)
-    return { ...base, type: 'wireguard', wireguard: wg }
-  }
+  if (tab.value === 'amneziawg')
+    return { ...manualConnection({ protocol: 'amneziawg', id: base.id, name: base.name, amneziawg: awgText.value }), ...base }
+  if (tab.value === 'wireguard')
+    return { ...importConnections(wgText.value, 'profile.conf')[0]!, ...base }
   const obj = JSON.parse(sbText.value || '{}')
   if (obj.outbound) return { ...base, type: 'singbox', outbound: obj.outbound }
   if (obj.endpoint) return { ...base, type: 'singbox', endpoint: obj.endpoint }
@@ -88,45 +99,75 @@ function build(): Connection {
   return endpointTypes.includes(obj.type) ? { ...base, type: 'singbox', endpoint: obj } : { ...base, type: 'singbox', outbound: obj }
 }
 
-// Validate local identity constraints before replacing or appending the draft profile.
-function save() {
+// Validate a copied draft before replacing or appending the profile. Apply stays separate.
+async function save() {
+  if (busy.value || committed) return
+  busy.value = true
   error.value = ''
-  let conn: Connection
+  const generation = ++saveGeneration
+  const edit = props.edit
+  const config = store.state.config
+  // Auto-detected AWG is parsed from wgText; compare that input after validation.
+  const text = awgText.value
+  const wgSnap = wgText.value
+  const idSnap = id.value
+  const nameSnap = name.value
+  const tabSnap = tab.value
   try {
-    conn = build()
+    const conn = build()
+    if (tab.value === 'amneziawg' && awgText.value.trim().startsWith('vpn://')) {
+      error.value = t('ui.awgWizardOnly')
+      return
+    }
+    if (!/^[a-z0-9][a-z0-9_-]*$/.test(conn.id)) {
+      error.value = t('dialog.errId')
+      return
+    }
+    if (conn.id === 'direct' || conn.id === 'block') {
+      error.value = t('dialog.errReserved')
+      return
+    }
+    if (!config) throw new Error(DRAFT_CHANGED)
+    const list = config.connections ?? []
+    if (list.some((c) => c.id === conn.id && c !== edit)) {
+      error.value = t('dialog.errDup', { id: conn.id })
+      return
+    }
+    if (conn.type === 'amneziawg') {
+      const cfg = JSON.parse(JSON.stringify(config)) as Config
+      const index = edit ? list.indexOf(edit) : -1
+      cfg.connections ??= []
+      if (edit && index < 0) throw new Error(DRAFT_CHANGED)
+      if (index >= 0) cfg.connections.splice(index, 1, conn)
+      else cfg.connections.push(conn)
+      if (edit && edit.id !== conn.id) renameTarget(edit.id, conn.id, cfg)
+      await api.validateConfig(cfg)
+      if (
+        generation !== saveGeneration || !props.show || props.edit !== edit ||
+        store.state.config !== config || awgText.value !== text || wgText.value !== wgSnap ||
+        id.value !== idSnap || name.value !== nameSnap || tab.value !== tabSnap
+      ) throw new Error(DRAFT_CHANGED)
+    }
+    if (store.state.config !== config || !props.show || props.edit !== edit) throw new Error(DRAFT_CHANGED)
+    const live = config.connections ?? []
+    if (edit) {
+      const i = live.indexOf(edit)
+      if (i < 0) throw new Error(DRAFT_CHANGED)
+      if (edit.id !== conn.id) renameTarget(edit.id, conn.id)
+      live.splice(i, 1, conn)
+    } else live.push(conn)
+    committed = true
+    message.info(t('dialog.added'))
+    emit('update:show', false)
   } catch (e) {
-    error.value = (e as Error).message
-    return
+    if (props.show) error.value = t(connectionErrorKey(e))
+  } finally {
+    busy.value = false
   }
-  if (!/^[a-z0-9][a-z0-9_-]*$/.test(conn.id)) {
-    error.value = t('dialog.errId')
-    return
-  }
-  if (conn.id === 'direct' || conn.id === 'block') {
-    error.value = t('dialog.errReserved')
-    return
-  }
-  const list = store.state.config!.connections!
-  const clash = list.find((c) => c.id === conn.id && c !== props.edit)
-  if (clash) {
-    error.value = t('dialog.errDup', { id: conn.id })
-    return
-  }
-  if (props.edit) {
-    const i = list.indexOf(props.edit)
-    // Keep draft references consistent when the connection ID changes.
-    if (props.edit.id !== conn.id) renameTarget(props.edit.id, conn.id)
-    list.splice(i, 1, conn)
-  } else {
-    list.push(conn)
-  }
-  message.info(t('dialog.added'))
-  emit('update:show', false)
 }
 
 // Rewrite routing, fallback, and DNS references within the shared draft.
-function renameTarget(from: string, to: string) {
-  const cfg = store.state.config!
+function renameTarget(from: string, to: string, cfg = store.state.config!) {
   for (const g of cfg.groups ?? []) if (g.target === from) g.target = to
   for (const n of cfg.networks ?? []) if (n.target === from) n.target = to
   for (const c of cfg.clients ?? []) if (c.target === from) c.target = to
@@ -182,6 +223,19 @@ function renameTarget(from: string, to: string) {
             placeholder="[Interface]&#10;PrivateKey = …&#10;Address = 10.13.13.2/32&#10;&#10;[Peer]&#10;PublicKey = …&#10;Endpoint = 203.0.113.10:51820&#10;AllowedIPs = 0.0.0.0/0"
           />
           <div class="hint">{{ t('dialog.wgHint') }}</div>
+          <div class="hint">{{ t('ui.confPolicy') }}</div>
+        </NTabPane>
+        <NTabPane name="amneziawg" tab="AmneziaWG (.conf)">
+          <NInput
+            v-model:value="awgText"
+            type="textarea"
+            :autosize="{ minRows: 10, maxRows: 16 }"
+            :input-props="{ autocomplete: 'off', spellcheck: false }"
+            class="mono"
+            :placeholder="t('ui.awgProfile')"
+          />
+          <div class="hint">{{ t('ui.awgHint') }}</div>
+          <div class="hint">{{ t('ui.confPolicy') }}</div>
         </NTabPane>
         <NTabPane name="singbox" tab="sing-box JSON">
           <NInput
@@ -198,8 +252,8 @@ function renameTarget(from: string, to: string) {
       <NAlert v-if="error" type="error" :show-icon="false" style="margin-top: 12px">{{ error }}</NAlert>
       <template #footer>
         <NSpace justify="end">
-          <NButton @click="emit('update:show', false)">{{ t('common.cancel') }}</NButton>
-          <NButton type="primary" :disabled="!id" @click="save">{{ isEdit ? t('common.save') : t('common.add') }}</NButton>
+          <NButton :disabled="busy" @click="emit('update:show', false)">{{ t('common.cancel') }}</NButton>
+          <NButton type="primary" :disabled="!id || busy" :loading="busy" @click="save">{{ isEdit ? t('common.save') : t('common.add') }}</NButton>
         </NSpace>
       </template>
     </NCard>

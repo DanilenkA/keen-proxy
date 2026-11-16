@@ -3,6 +3,8 @@ package journal
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -196,5 +198,57 @@ func TestClientFilterPreservesIPv6Identity(t *testing.T) {
 		if got := e.field("client"); got != "2001:db8::1" {
 			t.Fatalf("%s -> %s", value, got)
 		}
+	}
+}
+
+func TestMaskerRedactsAmneziaWGKeys(t *testing.T) {
+	const (
+		privateKey = "awg-private-key-11111111111111111111"
+		psk        = "awg-preshared-key-222222222222222222"
+		hpk        = "awg-header-key-333333333333333333333"
+	)
+	cfg := &model.Config{Connections: []model.Connection{{
+		Type: model.ConnAmneziaWG,
+		AmneziaWG: "[Interface]\nPrivateKey = " + privateKey + "\nHeaderProtectionKey = " + hpk +
+			"\n# PrivateKey = comment-must-not-be-required\n[Peer]\nPresharedKey = " + psk + "\n",
+	}}}
+	got := Masker(cfg)("handshake used " + privateKey + " and " + psk + " and " + hpk)
+	for _, secret := range []string{privateKey, psk, hpk} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("journal mask left %s in %s", secret, got)
+		}
+	}
+}
+
+func TestMaskerRedactsHeaderProtectionKeyHex(t *testing.T) {
+	const encoded = "pBNbQ3vIFMTZCbCkQtLObNUtsM9hAi+ZhlrgZbH0Xgc="
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(raw) != 32 {
+		t.Fatal(err)
+	}
+	lower := hex.EncodeToString(raw)
+	upper := strings.ToUpper(lower)
+	for _, key := range []struct{ name, value string }{{"base64", encoded}, {"hex", lower}} {
+		t.Run(key.name, func(t *testing.T) {
+			cases := []struct {
+				name string
+				conn model.Connection
+			}{
+				{"raw endpoint", model.Connection{Type: model.ConnSingBox, Endpoint: map[string]any{"type": "wireguard", "header_protection_key": key.value}}},
+				{"native spaced", model.Connection{Type: model.ConnAmneziaWG, AmneziaWG: "[Interface]\nHeaderProtectionKey = " + key.value + "\n"}},
+				{"native compact", model.Connection{Type: model.ConnAmneziaWG, AmneziaWG: "[Interface]\nHeaderProtectionKey=" + key.value + "\n"}},
+				{"native mixed case and tabs", model.Connection{Type: model.ConnAmneziaWG, AmneziaWG: "[Interface]\n\tHeAdErPrOtEcTiOnKeY\t= " + key.value + " # metadata\n"}},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					cfg := &model.Config{Connections: []model.Connection{tc.conn}}
+					got := Masker(cfg)("uapi header_protection_key=" + lower + " HEADER=" + upper + " conf " + key.value)
+					want := "uapi header_protection_key=" + masked + " HEADER=" + masked + " conf " + masked
+					if got != want {
+						t.Fatalf("journal redaction = %q, want %q", got, want)
+					}
+				})
+			}
+		})
 	}
 }
