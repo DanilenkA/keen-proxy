@@ -2,10 +2,12 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/ordo-systems/keen-proxy/internal/journal"
+	"github.com/ordo-systems/keen-proxy/internal/model"
 	"github.com/ordo-systems/keen-proxy/internal/netfilter"
 )
 
@@ -20,6 +22,14 @@ func (d *Daemon) installFirewall(ctx context.Context) error {
 	}
 	d.planOn, d.planPending = true, false
 	return nil
+}
+
+func (d *Daemon) detachStartupJumps() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// After a crash the old mode is unknown. TPROXY's plan includes the entry
+	// jumps shared with REDIRECT, and Detach leaves all chains and routes alone.
+	return d.opt.Firewall.Detach(ctx, netfilter.Plan{Mode: model.InterceptTProxy})
 }
 
 // checkFirewall runs under d.mu. An installed or pending plan can be repaired;
@@ -70,6 +80,7 @@ func (d *Daemon) applyAndVerifyFirewall(ctx context.Context, event *journal.Fire
 	event.After = nil
 	if err := d.installFirewall(ctx); err != nil {
 		event.Outcome, event.ApplyError = "apply_failed", err.Error()
+		event.Restore = journalRestoreFailure(err)
 		return
 	}
 	event.After = journalFirewallCheck(d.opt.Firewall.Check(ctx, d.plan))
@@ -85,6 +96,17 @@ func journalFirewallCheck(failure *netfilter.CheckFailure) *journal.FirewallChec
 	}
 	check := journal.FirewallCheck(*failure)
 	return &check
+}
+
+func journalRestoreFailure(err error) *journal.RestoreDiagnostic {
+	var f *netfilter.RestoreFailure
+	if !errors.As(err, &f) {
+		return nil
+	}
+	return &journal.RestoreDiagnostic{
+		Wait: f.Wait, ExitCode: f.ExitCode, Line: f.Line, Table: f.Table,
+		Operation: f.Operation, Chain: f.Chain, Target: f.Target,
+	}
 }
 
 func (d *Daemon) recordFirewallRecovery(event *journal.FirewallEvent) {
