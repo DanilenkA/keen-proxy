@@ -82,6 +82,22 @@ function open(index: number | null) {
 function toggleEntry(entry: string, enabled: boolean) {
   if (!applying.value) setEntryEnabled(props.group, entry, enabled)
 }
+
+function topLevelSuffix(line: string): string | undefined {
+  const entry = canonicalEntry(line)
+  return entry.type === 'domain_suffix' && !entry.value.includes('.') ? entry.value : undefined
+}
+
+const entryLines = computed(() => value.value.split('\n').map(s => s.split('#')[0]!.trim()).filter(Boolean))
+const topLevelZones = computed(() => {
+  const zones = new Set<string>()
+  for (const line of entryLines.value) {
+    const suffix = topLevelSuffix(line)
+    if (suffix) zones.add(`.${suffix}`)
+  }
+  return [...zones].join(', ')
+})
+
 // Validate a copied configuration before updating entries and requesting a domain preview.
 async function save() {
   const draft = store.state.config, group = props.group
@@ -89,16 +105,31 @@ async function save() {
   if (!draft || groupIndex < 0 || applying.value || saving.value) return
   const original = group.entries, originalFlags = group.disabled_entries
   error.value = ''
-  const lines = value.value.split('\n').map(s => s.split('#')[0]!.trim()).filter(Boolean)
+  const lines = entryLines.value
   if (!lines.length || (editing.value !== null && lines.length !== 1)) { error.value = t('domains.oneOnly'); return }
   saving.value = true
   try {
     const cfg = JSON.parse(JSON.stringify(draft))
     const next = [...original]
     const previous = editing.value === null ? '' : original[editing.value]!
-    if (editing.value === null) next.push(...lines.filter(s => !next.includes(s)))
-    else next[editing.value] = lines[0]!
-    const flags = editing.value === null ? props.group.disabled_entries : migrateFlag(props.group.disabled_entries, previous, lines[0]!, entryIdentity)
+    if (editing.value === null) {
+      const seen = new Set(original.map(line => topLevelSuffix(line) ?? line))
+      for (const line of lines) {
+        const entry = topLevelSuffix(line) ?? line
+        if (seen.has(entry)) continue
+        seen.add(entry)
+        next.push(entry)
+      }
+    } else {
+      const line = lines[0]!
+      const suffix = topLevelSuffix(line)
+      if (suffix && original.some((other, index) => index !== editing.value && topLevelSuffix(other) === suffix)) {
+        error.value = t('domains.duplicateSuffix', { suffix })
+        return
+      }
+      next[editing.value] = suffix ?? line
+    }
+    const flags = editing.value === null ? props.group.disabled_entries : migrateFlag(props.group.disabled_entries, previous, next[editing.value]!, entryIdentity)
     cfg.groups[groupIndex].entries = next
     cfg.groups[groupIndex].disabled_entries = flags
     await api.validateConfig(cfg)
@@ -176,6 +207,9 @@ function remove(index: number) {
     </div>
     <NModal v-model:show="show" preset="card" :title="t(editing === null ? 'domains.add' : 'domains.edit')" style="width: min(560px, 94vw)">
       <NInput v-model:value="value" type="textarea" :autosize="{ minRows: 4, maxRows: 12 }" :placeholder="t('domains.placeholder')" />
+      <div role="status">
+        <p v-if="topLevelZones" class="zone-hint">{{ t('domains.zoneHint', { zones: topLevelZones }) }}</p>
+      </div>
       <NAlert v-if="error" type="error" style="margin-top: 12px">{{ error }}</NAlert>
       <template #footer><div class="dialog-actions"><NButton @click="show = false">{{ t('common.cancel') }}</NButton><NButton type="primary" :loading="saving" :disabled="applying" @click="save">{{ t('common.save') }}</NButton></div></template>
     </NModal>
@@ -184,6 +218,7 @@ function remove(index: number) {
 
 <style scoped>
 .domain-entries { padding: 10px 16px 14px; }
+.zone-hint { margin: 8px 0 0; overflow-wrap: anywhere; }
 .entries-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .entry-pages { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
 .entry { border-top: 1px solid var(--line, #ffffff12); }
